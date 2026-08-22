@@ -735,6 +735,22 @@ def _chain_async_tool_call_wrappers(
     return result
 
 
+# ============================================================================
+# create_agent —— LangChain v1 的 Agent 工厂（本文件 = 装配车间）
+# 它做三件事：
+#   1. 规整 model / tools / middleware / response_format 等入参，解析 state schema
+#   2. 从零装配一张 StateGraph（ReAct 循环）：节点与边全部是"条件性添加"的
+#   3. 编译出 CompiledStateGraph，附 recursion_limit=9999 等运行时配置
+#
+# 生成的图结构（顶层视角）：
+#   START → entry_node →(before_agent/before_model 链)→ model
+#   model →(条件边)→ tools（每个未兑现 tool_call 发一个 Send 并行 fan-out）
+#   tools →(条件边)→ loop_entry_node（循环） / exit_node（return_direct 短路）
+#   model →(条件边)→ exit_node（after_agent 链 → END）
+#
+# 注释集中区：节点添加(~1501)、四锚点(~1592)、条件边注册(~1620)、
+# 边函数实现(_make_model_to_tools_edge ~1840 / _make_tools_to_model_edge ~1921)
+# ============================================================================
 # No `response_format`: there is no structured output, so `ResponseT` resolves to `Any`.
 @overload
 def create_agent(
@@ -1080,6 +1096,15 @@ def create_agent(
     if len({m.name for m in middleware}) != len(middleware):
         msg = "Please remove duplicate middleware instances."
         raise AssertionError(msg)
+    # 按钩子类型筛选中间件，得到四个子列表（保持注册顺序）：
+    #   判断方式：m.__class__.xxx is not AgentMiddleware.xxx —— 通过函数对象身份
+    #   比较，子类 override 了钩子后，类的该属性指向子类方法，不再等于基类原版方法。
+    #   "or" 同时检查 sync/async 两个变体，只要重写任意一个就计入该列表。
+    #   - middleware_w_before_agent: 有 before_agent 钩子（agent 启动时只跑一次）
+    #   - middleware_w_before_model: 有 before_model 钩子（每轮循环、调模型前执行）
+    #   - middleware_w_after_model:  有 after_model 钩子（每轮循环、模型响应后执行）
+    #   - middleware_w_after_agent:  有 after_agent 钩子（agent 结束时只跑一次）
+    #   [0] 是第一个注册的中间件，[-1] 是最后一个。
     middleware_w_before_agent = [
         m
         for m in middleware
@@ -1155,6 +1180,10 @@ def create_agent(
 
     resolved_state_schema, input_schema, output_schema = _resolve_schemas(state_schemas)
 
+    # 创建状态图。四个 schema 分工不同：
+    #   - state_schema：图核心状态（messages 等，中间件声明的字段已合并进来）
+    #   - input_schema / output_schema：对外暴露的入参 / 出参（可裁剪 state 字段）
+    #   - context_schema：只读上下文（随每次调用传入，不随线程持久化）
     # create graph, add nodes
     graph: StateGraph[
         AgentState[ResponseT], ContextT, InputAgentState, OutputAgentState[ResponseT]
@@ -1498,6 +1527,10 @@ def create_agent(
         result = await awrap_model_call_handler(request, _execute_model_async)
         return _build_commands(result.model_response, result.commands)
 
+    # 添加核心节点。
+    #   - "model" 节点：封装"选消息→拼 prompt→调模型"这一整段，RunnableCallable
+    #     同时挂 sync/async 两个实现（trace=False 避免 tracing 刷屏）
+    #   - "tools" 节点：仅当传了工具才存在 —— create_agent(tools=[]) 时图里没有它
     # Use sync or async based on model capabilities
     graph.add_node("model", RunnableCallable(model_node, amodel_node, trace=False))
 
@@ -1505,6 +1538,9 @@ def create_agent(
     if tool_node is not None:
         graph.add_node("tools", tool_node)
 
+    # 中间件挂点节点：before_agent / before_model / after_model / after_agent
+    # 四类钩子，只给"真正被中间件 override 的挂点"建节点（没 override 就不存在），
+    # 节点命名规则：{中间件名}.{挂点名}（如 "history_middleware.before_model"）
     # Add middleware nodes
     for m in middleware:
         if (
@@ -1589,7 +1625,22 @@ def create_agent(
                 f"{m.name}.after_agent", after_agent_node, input_schema=resolved_state_schema
             )
 
+    # 四个"锚点"决定整张图的路由骨架，后面所有边都围绕它们连：
+    #   entry_node      图入口，整个 agent 只跑一次（START 落点）
+    #   loop_entry_node 循环回起点：tools 跑完回到这里，开始下一轮迭代
+    #   loop_exit_node  每轮迭代的出口：条件边从这里出发（可执行多次）
+    #   exit_node       最终出口：整张图只收一次尾（after_agent 链 → END）
     # Determine the entry node (runs once at start): before_agent -> before_model -> model
+    # 决定整张图的入口节点 entry_node（START 的落点，整个 agent 只执行一次）：
+    #   - 若有 before_agent 中间件 → 入口是第一个 before_agent 节点。before_agent 是
+    #     "最外层"钩子，必须先经过它，后面的 before_agent 链 → before_model 链 → model
+    #     才能按顺序触发。
+    #   - 否则若有 before_model 中间件 → 入口是第一个 before_model 节点。没有外层
+    #     钩子时，直接从每轮循环的起点 before_model 链进入。
+    #   - 两者都没有 → 入口就是 "model" 节点。
+    #   注意与 loop_entry_node 的区别：entry_node 只进一次，允许以 before_agent 开头；
+    #   而 loop_entry_node 是"工具执行完循环回来的起点"，必须排除 before_agent
+    #   （它只在 agent 开始时跑一次），所以只用 before_model 判断。
     if middleware_w_before_agent:
         entry_node = f"{middleware_w_before_agent[0].name}.before_agent"
     elif middleware_w_before_model:
@@ -1599,6 +1650,15 @@ def create_agent(
 
     # Determine the loop entry node (beginning of agent loop, excludes before_agent)
     # This is where tools will loop back to for the next iteration
+    # 决定循环回起点 loop_entry_node（工具执行完后，下一轮迭代从这里重新进入）：
+    #   - 必须排除 before_agent：它只在 agent 启动时跑一次，循环回来不能重跑，
+    #     否则每轮迭代都会重复执行 before_agent 钩子。
+    #   - 若有 before_model 中间件 → 从第一个 before_model 节点重新进入，
+    #     保证每轮都先走 before_model 链，再进 model。
+    #   - 没有 before_model → 直接从 "model" 节点进入下一轮。
+    #   与 entry_node 的区别：entry_node 是 START 的落点、整个 agent 只进一次，
+    #   允许以 before_agent 开头；loop_entry_node 是循环路径的入口、每轮都进，
+    #   所以只用 middleware_w_before_model 判断。
     if middleware_w_before_model:
         loop_entry_node = f"{middleware_w_before_model[0].name}.before_model"
     else:
@@ -1618,6 +1678,10 @@ def create_agent(
         exit_node = END
 
     graph.add_edge(START, entry_node)
+    # 条件边注册（仅当有 tools 节点时）：
+    #   1) "tools" → tools_to_model：工具跑完，路由去 loop_entry_node（循环）还是 exit_node
+    #   2) loop_exit_node → model_to_tools：模型响应后，路由去 tools / loop_entry_node / exit_node
+    #   条件边返回 str = 去单一目标；返回 list[Send] = 并行 fan-out 多个目标
     # add conditional edges only if tools exist
     if tool_node is not None:
         # Only include exit_node in destinations if any tool has return_direct=True
@@ -1837,6 +1901,14 @@ def _fetch_last_ai_and_tool_messages(
     return None, []
 
 
+# 条件边 ①：model → tools（ReAct 循环的心脏）
+# 从 loop_exit_node 出发，6 步路由决定"继续调工具 / 回模型 / 收尾"：
+#   1. jump_to 中间件显式指路（HITL 等）→ 优先
+#   2. 没有 AIMessage（消息被清空）→ 收尾
+#   3. 模型没发起任何 tool_call → 收尾（经典退出条件）
+#   4. 有"未兑现"的 tool_call → 每个发一个 Send("tools", ...) 并行 fan-out
+#   5. 已有 structured_response → 收尾
+#   6. tool_calls 全"已兑现"（中间件/人工注入过 ToolMessage）→ 回 model 再跑一轮
 def _make_model_to_tools_edge(
     *,
     model_destination: str,
@@ -1891,6 +1963,8 @@ def _make_model_to_tools_edge(
     return model_to_tools
 
 
+# 条件边 ①'：model → model（无 tools 但配了 response_format 时）
+# 结构化输出生成失败（如模型没按 schema 出）时回 model 重试，成功则收尾
 def _make_model_to_model_edge(
     *,
     model_destination: str,
@@ -1918,6 +1992,12 @@ def _make_model_to_model_edge(
     return model_to_model
 
 
+# 条件边 ②：tools → model（循环回去，还是结束？）
+#   1. 无 AIMessage → 回 model 重试
+#   2. 本轮所有 client-side 工具都 return_direct=True → 工具结果即答案，直接 END
+#      （只统计 client-side：provider 工具不在 tool_node.tools_by_name 里）
+#   3. 执行了结构化输出工具 → END
+#   4. 默认：工具跑完 → 回 loop_entry_node 开始下一轮循环
 def _make_tools_to_model_edge(
     *,
     tool_node: ToolNode,
@@ -1954,6 +2034,10 @@ def _make_tools_to_model_edge(
     return tools_to_model
 
 
+# 中间件节点之间的连线。
+# 没配 can_jump_to → 普通 add_edge（默认走到下一个中间件/锚点）；
+# 配了 can_jump_to → 条件边，中间件可通过 state["jump_to"] 把图"改道"到别处
+# （这是 HITL / 人工介入实现跳转的机制）
 def _add_middleware_edge(
     graph: StateGraph[
         AgentState[ResponseT], ContextT, InputAgentState, OutputAgentState[ResponseT]

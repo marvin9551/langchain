@@ -344,6 +344,12 @@ PrivateStateAttr = OmitFromSchema(input=True, output=True)
 """Annotation used to mark state attributes as purely internal for a given middleware."""
 
 
+# AgentState —— create_agent 生成图的"线程级内存模型"（1.3.x 只剩 3 字段）：
+#   messages:            聊天记录，add_messages reducer 让各节点追加时自动合并去重
+#   jump_to:             中间件跳转指令（EphemeralValue=不持久化，PrivateStateAttr=不进出入参），
+#                        HITL 等场景用来把图"改道"到指定节点
+#   structured_response: 结构化输出结果（OmitFromInput=外部不能直接注入，只能由模型产出）
+# 注意：旧版 remaining_steps 已移除，步骤上限改由运行时 recursion_limit 兜底
 class AgentState(TypedDict, Generic[ResponseT]):
     """State schema for the agent."""
 
