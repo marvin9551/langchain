@@ -1666,12 +1666,31 @@ def create_agent(
 
     # Determine the loop exit node (end of each iteration, can run multiple times)
     # This is after_model or model, but NOT after_agent
+    # 决定每轮迭代的出口 loop_exit_node（条件边从这里出发，每轮都可能走一次）：
+    #   - 每轮循环的流程：before_model 链 → model → after_model 链 → 条件边路由。
+    #     after_model 链跑完后，下一步去哪（tools / 回 model / 收尾）由条件边决定，
+    #     所以"循环出口"就是 after_model 链的末尾。
+    #   - 若有 after_model 中间件 → 出口是第一个 after_model 节点（每个中间件的
+    #     after_model 节点按注册顺序依次相连，链的末端就是 loop_exit_node）。
+    #   - 没有 after_model → 出口就是 "model" 节点。
+    #   为什么不是 after_agent：after_agent 是 agent 结束时才收一次尾的钩子，
+    #   不属于"每轮循环"的路径，不能作为循环出口，它是 exit_node 的职责。
     if middleware_w_after_model:
         loop_exit_node = f"{middleware_w_after_model[0].name}.after_model"
     else:
         loop_exit_node = "model"
 
     # Determine the exit node (runs once at end): after_agent or END
+    # 决定最终出口 exit_node（整张图只收一次尾，从这里走完 after_agent 链后进 END）：
+    #   - 若有 after_agent 中间件 → 出口是最后一个 after_agent 节点（用 [-1] 取链尾）。
+    #     所有 after_agent 节点按注册顺序相连成链，链尾连 END，保证每个中间件的
+    #     after_agent 钩子都在 agent 结束时按序执行、只执行一次。
+    #   - 没有 after_agent → 出口直接是 END。
+    #   - 什么时候走到 exit_node：每轮循环由条件边判断"是否该收尾"，一旦决定收尾，
+    #     （若配置了 after_agent 链）先跑完 after_agent 链再进 END。
+    #   与 loop_exit_node 的区别：loop_exit_node 是"每轮循环"的出口（after_model 链尾），
+    #   exit_node 是"整个 agent"的出口（after_agent 链尾），前者每轮都可能经过，
+    #   后者整个执行只经过一次。
     if middleware_w_after_agent:
         exit_node = f"{middleware_w_after_agent[-1].name}.after_agent"
     else:
